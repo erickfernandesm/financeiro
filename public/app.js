@@ -80,18 +80,24 @@
   const base = () => ({ saldo: 0, saldoDefinido: false, folga: 0, entradas: [], contas: [], status: {} });
   let S = base();
   let G = {}; // gastos por mês: { '2026-11': [ {id, valor, desc, cat, forma, data, criado} ] }
-  const ui = { tab: 'mes', mes: MES_ATUAL, sel: new Set(), carregando: false, aviso: '' };
+  const ui = { tab: 'mes', mes: MES_ATUAL, sel: new Set(), carregando: false, aviso: '', login: false };
   let acaoConfirmada = null;
 
   /* ---------- onde os dados ficam ---------- */
-  // Com um adaptador de sincronização (window.FolegoNuvem, carregado antes deste arquivo),
-  // os dados ficam num banco online e aparecem em todos os aparelhos.
-  // Sem ele, ficam no armazenamento do navegador.
-  const nuvem = window.FolegoNuvem || null;
+  // Três jeitos, escolhidos ao abrir:
+  // 1. Servidor do Fôlego (/api, com login): dados no banco, iguais em todos os aparelhos.
+  // 2. Adaptador externo opcional (window.FolegoNuvem), com a mesma interface do servidor.
+  // 3. Sem nenhum dos dois: armazenamento do navegador.
+  //
+  // Interface de um adaptador:
+  //   iniciar() -> { estado, gastos }   (lança { code: 'login' } se precisar entrar)
+  //   salvarEstado(obj), salvarGastos(mes, itens)
+  //   assinar(cb) -> chama cb({ estado?, gastos? }) quando chegam dados novos
+  //   baixar(nome, texto) -> opcional, para exportar
 
   const LOCAL_S = 'folego:v1';
   const LOCAL_G = 'folego:gastos:v1';
-  const store = { modo: 'local', db: null, filas: {} };
+  const store = { modo: 'local', ad: null, filas: {}, falhas: new Set() };
 
   function lerLocal() {
     try {
@@ -112,97 +118,197 @@
 
   const espera = ms => new Promise(r => setTimeout(r, ms));
 
-  async function escrever(path, data) {
-    const ref = store.db.doc(path);
-    try { await ref.set(data); }
+  // servidor do Fôlego (Cloudflare Pages Functions + D1)
+  async function pedir(url, opcoes = {}) {
+    let r;
+    try {
+      r = await fetch(url, Object.assign({ credentials: 'same-origin', cache: 'no-store' }, opcoes));
+    } catch (e) {
+      throw { code: 'offline' };
+    }
+    if (r.status === 401) throw { code: 'login' };
+    if (r.status === 413) throw { code: 'quota_exceeded' };
+    if (r.status === 404) throw { code: 'sem_servidor' };
+    if (!r.ok) throw { code: 'unavailable' };
+    return r.json();
+  }
+
+  const servidor = {
+    iniciar: () => pedir('/api/dados'),
+    salvarEstado: obj => pedir('/api/estado', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(obj) }),
+    salvarGastos: (m, itens) => pedir('/api/gastos/' + m, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ itens }) }),
+    assinar(cb) {
+      const puxar = async () => {
+        if (document.hidden || ui.login) return;
+        try { cb(await pedir('/api/dados')); }
+        catch (e) { if (e.code === 'login') pedirLogin(); }
+      };
+      setInterval(puxar, 30000);
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) puxar(); });
+      window.addEventListener('focus', puxar);
+    }
+  };
+
+  async function escrever(chave, dados) {
+    const ad = store.ad;
+    const fazer = () => chave === 'estado' ? ad.salvarEstado(dados) : ad.salvarGastos(chave.slice(7), dados.itens);
+    try { await fazer(); }
     catch (e) {
-      if (e && e.code === 'unavailable') { await espera(700 + Math.random() * 1300); await ref.set(data); }
+      if (e && (e.code === 'unavailable' || e.code === 'offline')) { await espera(800 + Math.random() * 1500); await fazer(); }
       else throw e;
     }
   }
 
   // uma gravação por vez em cada documento; mudanças rápidas viram uma só
-  function enfileirar(path, pegar) {
-    const f = store.filas[path] || (store.filas[path] = { busy: false, dirty: false, pegar: null });
+  function enfileirar(chave, pegar) {
+    const f = store.filas[chave] || (store.filas[chave] = { busy: false, dirty: false, pegar: null });
     f.pegar = pegar;
     if (f.busy) { f.dirty = true; return; }
     const rodar = async () => {
       f.busy = true; f.dirty = false;
-      try { await escrever(path, f.pegar()); }
-      catch (e) { erroDb(e); }
+      try { await escrever(chave, f.pegar()); store.falhas.delete(chave); }
+      catch (e) { store.falhas.add(chave); erroDb(e); }
       f.busy = false;
       if (f.dirty) rodar();
     };
     rodar();
   }
-  const pendente = path => { const f = store.filas[path]; return !!(f && (f.busy || f.dirty)); };
+  const pendente = chave => { const f = store.filas[chave]; return !!(f && (f.busy || f.dirty)); };
 
   function erroDb(e) {
     const c = e && e.code;
-    if (c === 'quota_exceeded') toast('O espaço para dados acabou. Apague gastos antigos para continuar salvando.');
+    if (c === 'login') { pedirLogin(); toast('Sua sessão terminou. Entre de novo para salvar.'); }
+    else if (c === 'quota_exceeded') toast('O espaço para dados acabou. Apague gastos antigos para continuar salvando.');
     else if (c === 'invalid_argument') toast('Não foi possível salvar. Só o dono deste Fôlego pode fazer alterações.');
     else toast('Não consegui salvar agora. Confira a internet e tente de novo.');
   }
 
   function save() {
-    if (store.modo === 'db') enfileirar('app/estado', () => clone(S));
+    if (store.ad) enfileirar('estado', () => clone(S));
     else gravarLocal();
   }
 
   function saveGastos(m) {
-    if (store.modo === 'db') enfileirar('gastos/' + m, () => ({ itens: clone(G[m] || []) }));
+    if (store.ad) enfileirar('gastos:' + m, () => ({ itens: clone(G[m] || []) }));
     else gravarLocal();
+  }
+
+  // dados que chegam de outro aparelho; o que ainda está sendo salvo aqui não é sobrescrito
+  function receber(d) {
+    if (!d) return;
+    if ('estado' in d && !pendente('estado')) S = d.estado ? Object.assign(base(), clone(d.estado)) : base();
+    if (d.gastos) {
+      const novo = {};
+      Object.keys(d.gastos).forEach(m => { novo[m] = pendente('gastos:' + m) ? (G[m] || []) : clone(d.gastos[m] || []); });
+      Object.keys(G).forEach(m => { if (pendente('gastos:' + m)) novo[m] = G[m]; });
+      G = novo;
+    }
+    if (!ui.carregando && !ui.login) render();
+  }
+
+  function pedirLogin() {
+    if (store.modo !== 'servidor' || ui.login) return;
+    ui.login = true;
+    fecharModal();
+    render();
+  }
+
+  async function carregar() {
+    ui.carregando = true;
+    ui.aviso = '';
+    render();
+    const timer = setTimeout(() => {
+      if (ui.carregando) { ui.aviso = 'Seus dados ainda não chegaram. Confira a internet.'; render(); }
+    }, 10000);
+    try {
+      const d = await store.ad.iniciar();
+      clearTimeout(timer);
+      ui.carregando = false;
+      ui.login = false;
+      ui.aviso = '';
+      receber({ estado: d ? d.estado : null, gastos: d ? d.gastos || {} : {} });
+      render();
+      return true;
+    } catch (e) {
+      clearTimeout(timer);
+      ui.carregando = false;
+      if (e && e.code === 'login') { ui.login = true; ui.aviso = ''; render(); return false; }
+      throw e;
+    }
   }
 
   async function iniciar() {
     montarShell();
-    if (!nuvem || !nuvem.disponivel()) { lerLocal(); render(); return; }
+    const externo = window.FolegoNuvem && window.FolegoNuvem.disponivel() ? window.FolegoNuvem : null;
 
-    ui.carregando = true;
-    render();
-    let db = null;
-    try { db = await nuvem.banco(); } catch (e) { db = null; }
-    if (!db) {
-      ui.carregando = false;
-      ui.aviso = 'Não consegui conectar ao armazenamento online. Por enquanto, o que você lançar fica salvo só neste aparelho.';
-      lerLocal();
-      render();
-      return;
+    if (externo) {
+      store.ad = externo;
+      store.modo = 'externo';
+    } else if (/^https?:$/.test(location.protocol)) {
+      store.ad = servidor;
+      store.modo = 'servidor';
+    } else {
+      lerLocal(); render(); return;
     }
-    store.db = db;
-    store.modo = 'db';
 
-    const timer = setTimeout(() => {
-      if (ui.carregando) { ui.aviso = 'Seus dados ainda não chegaram. Confira a internet; eles aparecem assim que a conexão voltar.'; render(); }
-    }, 10000);
-
-    db.doc('app/estado').onSnapshot(snap => {
-      if (pendente('app/estado')) return;
-      if (snap.exists) S = Object.assign(base(), clone(snap.data()));
-      else if (snap.metadata.fromCache) return;
-      else S = base();
-      if (!snap.metadata.fromCache) {
-        clearTimeout(timer);
-        if (ui.aviso.startsWith('Seus dados ainda')) ui.aviso = '';
+    try {
+      await carregar();
+    } catch (e) {
+      if (e && e.code === 'sem_servidor') {
+        // página aberta sem o servidor (ex.: Live Server): usa o navegador
+        store.ad = null;
+        store.modo = 'local';
+        lerLocal(); render(); return;
       }
-      ui.carregando = false;
+      ui.aviso = e && e.code === 'offline'
+        ? 'Sem conexão com a internet. Seus dados aparecem quando a conexão voltar.'
+        : 'Não consegui buscar seus dados. Recarregue a página para tentar de novo.';
       render();
-    }, () => {
-      clearTimeout(timer);
-      ui.carregando = false;
-      ui.aviso = 'Não consegui acessar seus dados. Recarregue a página para tentar de novo.';
-      render();
-    });
+      if (e && e.code === 'offline') {
+        const tentar = async () => { window.removeEventListener('online', tentar); try { await carregar(); } catch (x) { /* segue o aviso */ } };
+        window.addEventListener('online', tentar);
+      }
+    }
+    store.ad && store.ad.assinar && store.ad.assinar(receber);
+  }
 
-    db.collection('gastos').onSnapshot(snap => {
-      const novo = {};
-      snap.docs.forEach(d => {
-        novo[d.id] = pendente('gastos/' + d.id) ? (G[d.id] || []) : clone((d.data() || {}).itens || []);
-      });
-      Object.keys(G).forEach(m => { if (pendente('gastos/' + m)) novo[m] = G[m]; });
-      G = novo;
-      if (!ui.carregando) render();
-    }, () => { /* sem gastos online nesta visita */ });
+  async function entrar(senha) {
+    let r;
+    try {
+      r = await fetch('/api/login', { method: 'POST', credentials: 'same-origin', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ senha }) });
+    } catch (e) {
+      return 'Sem conexão com a internet.';
+    }
+    if (!r.ok) {
+      let msg = 'Não consegui entrar agora.';
+      try { msg = (await r.json()).erro || msg; } catch (e) { /* mensagem padrão */ }
+      return msg;
+    }
+    const tinhaFalhas = [...store.falhas];
+    try { await carregar(); } catch (e) { return 'Entrei, mas não consegui buscar seus dados. Recarregue a página.'; }
+    // regrava o que não tinha conseguido salvar antes da sessão terminar
+    tinhaFalhas.forEach(k => { if (k === 'estado') save(); else saveGastos(k.slice(7)); });
+    return '';
+  }
+
+  async function sair() {
+    try { await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' }); } catch (e) { /* sai mesmo assim */ }
+    S = base();
+    G = {};
+    ui.login = true;
+    render();
+  }
+
+  function telaLogin() {
+    return `<section class="login">
+      <div class="brand grande">Fôlego</div>
+      <p class="muted">Digite sua senha para ver suas contas e gastos.</p>
+      <form data-form="login" autocomplete="on">
+        <div class="field"><label for="l-senha">Senha</label><input id="l-senha" name="senha" type="password" autocomplete="current-password" required></div>
+        <p class="erro-login" id="l-erro" hidden></p>
+        <div class="sheet-actions"><button class="btn primary grow">Entrar</button></div>
+      </form>
+    </section>`;
   }
 
   /* ---------- contas e entradas ---------- */
@@ -394,6 +500,13 @@
     document.querySelectorAll('[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab === ui.tab));
     const app = $('#app');
     if (!app) return;
+    document.body.classList.toggle('sem-sessao', !!ui.login);
+    if (ui.login) {
+      app.innerHTML = telaLogin();
+      const campo = $('#l-senha');
+      if (campo) setTimeout(() => campo.focus(), 40);
+      return;
+    }
     let h = ui.aviso ? `<div class="aviso">${esc(ui.aviso)}</div>` : '';
     if (ui.carregando) {
       h += `<section class="card carregando"><h2>Buscando seus dados</h2><p class="muted">Suas contas, entradas e gastos aparecem aqui em instantes.</p></section>`;
@@ -741,7 +854,7 @@
     const fixoCon = soma(ativos(S.contas));
     const entradas = [...S.entradas].sort((a, b) => a.nome.localeCompare(b.nome));
     const contas = [...S.contas].sort((a, b) => a.dia - b.dia || a.nome.localeCompare(b.nome));
-    const online = store.modo === 'db';
+    const online = store.modo !== 'local';
 
     return `<div class="page-head"><h1>Cadastros</h1><p class="muted">Tudo o que entra e sai, em um só lugar.</p></div>
 
@@ -788,7 +901,11 @@
           <button class="btn" data-a="importar">Importar dados</button>
           <button class="btn danger" data-a="apagar-tudo">Apagar tudo</button>
         </div>
-      </section>`;
+      </section>
+      ${store.modo === 'servidor' ? `<section class="card">
+        <div class="kv"><div class="k">Sair deste aparelho<small>Para ver seus dados de novo, vai ser preciso digitar a senha.</small></div>
+          <div class="v"><button class="btn" data-a="sair">Sair</button></div></div>
+      </section>` : ''}`;
   }
 
   /* ---------- janelas ---------- */
@@ -949,9 +1066,9 @@
   async function exportar() {
     const json = JSON.stringify(Object.assign(clone(S), { gastos: G }), null, 2);
     const nome = `folego-${HOJE_ISO}.json`;
-    if (nuvem && nuvem.disponivel() && nuvem.baixar) {
+    if (store.ad && store.ad.baixar) {
       try {
-        const ok = await nuvem.baixar(nome, json);
+        const ok = await store.ad.baixar(nome, json);
         toast(ok ? 'Cópia salva.' : 'Exportar não está disponível neste aparelho.');
       }
       catch (e) { if (e && e.code !== 'declined') toast('Não consegui salvar o arquivo agora.'); }
@@ -1126,6 +1243,9 @@
       }
 
       case 'exportar': exportar(); break;
+      case 'sair':
+        confirmar({ titulo: 'Sair deste aparelho?', texto: 'Seus dados continuam guardados. Para ver de novo, é só entrar com a senha.', botao: 'Sair' }, sair);
+        break;
       case 'importar': $('#arquivo').click(); break;
       case 'apagar-tudo':
         confirmar({ titulo: 'Apagar tudo?', texto: 'Contas, entradas, gastos e saldo serão apagados de todos os aparelhos. Não dá para desfazer. Se quiser, exporte uma cópia antes.', botao: 'Apagar tudo', perigo: true }, () => {
@@ -1187,6 +1307,20 @@
     ev.preventDefault();
     const f = form.elements;
     const tipo = form.dataset.form;
+
+    if (tipo === 'login') {
+      const botao = form.querySelector('button');
+      const erro = $('#l-erro');
+      botao.disabled = true;
+      entrar(f.senha.value).then(msg => {
+        if (!msg) return;
+        botao.disabled = false;
+        erro.textContent = msg;
+        erro.hidden = false;
+        f.senha.select();
+      });
+      return;
+    }
 
     if (tipo === 'gasto') {
       const valor = parseValor(f.valor.value);

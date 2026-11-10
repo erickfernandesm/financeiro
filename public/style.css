@@ -374,3 +374,10 @@ h3 { font-size: 18px; }
     padding-right: max(18px, env(safe-area-inset-right, 0px));
   }
 }
+
+/* entrada com senha */
+.login { max-width: 380px; margin: 12vh auto 0; }
+.brand.grande { font-size: 32px; margin: 0 0 6px; }
+.login > p { margin: 0 0 4px; }
+.erro-login { color: var(--neg); font-size: 14px; margin: 10px 0 0; }
+body.sem-sessao .top, body.sem-sessao .tabs, body.sem-sessao .bottom, body.sem-sessao .fab, body.sem-sessao .lancar-top { display: none !important; }
