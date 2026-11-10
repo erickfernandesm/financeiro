@@ -381,3 +381,10 @@ h3 { font-size: 18px; }
 .login > p { margin: 0 0 4px; }
 .erro-login { color: var(--neg); font-size: 14px; margin: 10px 0 0; }
 body.sem-sessao .top, body.sem-sessao .tabs, body.sem-sessao .bottom, body.sem-sessao .fab, body.sem-sessao .lancar-top { display: none !important; }
+
+/* categorias de gasto */
+.chip-add { padding: 8px 13px; border: 1px dashed var(--muted); border-radius: 999px; background: transparent; color: var(--muted); font-size: 14px; }
+.chip-add:hover { border-color: var(--accent); color: var(--accent); }
+.nova-cat { display: flex; gap: 8px; margin-top: 8px; }
+.nova-cat input { flex: 1; min-width: 0; border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 9px 12px; font-size: 16px; outline: none; }
+.nova-cat input:focus { border-color: var(--accent); }

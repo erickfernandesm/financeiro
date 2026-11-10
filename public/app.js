@@ -50,7 +50,7 @@
   const $ = s => document.querySelector(s);
 
   const CATEGORIAS = ['Moradia', 'Casa', 'Cartão', 'Transporte', 'Saúde', 'Educação', 'Assinaturas', 'Lazer', 'Outros'];
-  const CAT_GASTO = ['Mercado', 'Comida', 'Transporte', 'Casa', 'Saúde', 'Lazer', 'Compras', 'Outros'];
+  const CAT_GASTO = ['Mercado', 'Almoço', 'Comida', 'Moto Uber', 'Transporte', 'Cigarro', 'Casa', 'Saúde', 'Lazer', 'Compras', 'Outros'];
   const ORIGENS = { salario: 'Salário', freelance: 'Freelance', outro: 'Outro' };
   const FORMAS = { pix: 'Pix ou débito', dinheiro: 'Dinheiro', credito: 'Crédito' };
 
@@ -457,6 +457,38 @@
     saveGastos(m);
     save();
   }
+
+  // categorias de gasto: começam com a lista padrão e passam a ser as suas assim que você muda algo
+  const catsGasto = () => (Array.isArray(S.catGasto) && S.catGasto.length ? S.catGasto : CAT_GASTO);
+  const limparNomeCat = n => String(n || '').replace(/\s+/g, ' ').trim().slice(0, 30);
+  const catExiste = (nome, exceto) => catsGasto().some(c => c.toLowerCase() === nome.toLowerCase() && c !== exceto);
+
+  function criarCategoria(nome) {
+    nome = limparNomeCat(nome);
+    if (!nome) return { erro: 'Digite um nome para a categoria.' };
+    if (catExiste(nome)) return { erro: `Já existe a categoria ${nome}.` };
+    S.catGasto = [...catsGasto(), nome];
+    save();
+    return { nome };
+  }
+
+  function renomearCategoria(antigo, novo) {
+    novo = limparNomeCat(novo);
+    if (!novo) return 'Digite um nome para a categoria.';
+    if (novo === antigo) return '';
+    if (catExiste(novo, antigo)) return `Já existe a categoria ${novo}.`;
+    S.catGasto = catsGasto().map(c => (c === antigo ? novo : c));
+    // os gastos já lançados acompanham o novo nome
+    Object.keys(G).forEach(m => {
+      let mudou = false;
+      (G[m] || []).forEach(g => { if (g.cat === antigo) { g.cat = novo; mudou = true; } });
+      if (mudou) saveGastos(m);
+    });
+    save();
+    return '';
+  }
+
+  const usoCategoria = nome => Object.values(G).reduce((n, itens) => n + (itens || []).filter(g => g.cat === nome).length, 0);
 
   function ultimaForma() {
     try { return localStorage.getItem('folego:forma') || 'pix'; } catch (e) { return 'pix'; }
@@ -892,6 +924,19 @@
       </section>
 
       <section class="card">
+        <div class="card-head"><h2>Categorias de gasto</h2><span class="muted"></span><button class="btn small" data-a="nova-categoria">Nova categoria</button></div>
+        <p class="muted small">Elas aparecem ao lançar um gasto e no resumo "Para onde foi", na aba Gastos.</p>
+        ${catsGasto().map(c => {
+          const n = usoCategoria(c);
+          return `<div class="row">
+            <div class="row-main"><div class="row-title">${esc(c)}</div><div class="row-meta"><span>${n ? `${n} ${n === 1 ? 'gasto lançado' : 'gastos lançados'}` : 'nenhum gasto ainda'}</span></div></div>
+            <button class="btn small" data-a="renomear-categoria" data-nome="${esc(c)}">Renomear</button>
+            <button class="icon" data-a="remover-categoria" data-nome="${esc(c)}" aria-label="Remover ${esc(c)}">${ICON.close}</button>
+          </div>`;
+        }).join('')}
+      </section>
+
+      <section class="card">
         <div class="card-head"><h2>Cópia de segurança</h2></div>
         <p class="muted small">${online
           ? 'Seus dados ficam salvos online e aparecem em qualquer aparelho onde você abrir o Fôlego. Mesmo assim, vale exportar uma cópia de vez em quando.'
@@ -940,6 +985,30 @@
 
   const opts = (lista, atual) => lista.map(([v, t]) => `<option value="${v}" ${v === atual ? 'selected' : ''}>${t}</option>`).join('');
 
+  let seqChip = 0;
+  const chipCategoria = (c, marcada) => `<label class="chip-opt"><input type="radio" id="g-cat-${seqChip++}" name="cat" value="${esc(c)}" ${marcada ? 'checked' : ''}><span>${esc(c)}</span></label>`;
+
+  function criarCatInline() {
+    const campo = $('#g-nova-cat-nome');
+    if (!campo) return;
+    const r = criarCategoria(campo.value);
+    if (r.erro) { toast(r.erro); campo.focus(); return; }
+    const botao = document.querySelector('#g-chips .chip-add');
+    botao.insertAdjacentHTML('beforebegin', chipCategoria(r.nome, true));
+    campo.value = '';
+    $('#g-nova-cat').hidden = true;
+    toast(`Categoria ${r.nome} criada.`);
+  }
+
+  function formCategoria(antigo) {
+    abrirModal(`<h3>${antigo ? 'Renomear categoria' : 'Nova categoria de gasto'}</h3>
+      ${antigo ? '<p class="muted">Os gastos já lançados nesta categoria passam a usar o novo nome.</p>' : ''}
+      <form data-form="categoria" data-antigo="${esc(antigo || '')}">
+        <div class="field"><label for="cat-nome">Nome</label><input id="cat-nome" name="nome" maxlength="30" required value="${esc(antigo || '')}" placeholder="Ex.: Cigarro, Almoço, Moto Uber"></div>
+        <div class="sheet-actions"><button class="btn primary grow">Salvar</button></div>
+      </form>`);
+  }
+
   function formGasto(g) {
     const novo = !g;
     const dataPadrao = ui.mes === MES_ATUAL ? HOJE_ISO : ui.mes + '-01';
@@ -949,7 +1018,13 @@
       <form data-form="gasto" data-id="${g.id || ''}" autocomplete="off">
         <label class="valor-grande" for="g-valor"><span>R$</span><input id="g-valor" name="valor" inputmode="decimal" required placeholder="0,00" value="${g.valor === '' ? '' : valorInput(g.valor)}"></label>
         <div class="field"><label for="g-desc">Com o quê</label><input id="g-desc" name="desc" list="g-sug" maxlength="60" placeholder="Ex.: almoço, Uber, farmácia" value="${esc(g.desc)}"><datalist id="g-sug">${sugestoes}</datalist></div>
-        <div class="field"><span class="flabel">Categoria</span><div class="chips">${CAT_GASTO.map((c, i) => `<label class="chip-opt"><input type="radio" id="g-cat-${i}" name="cat" value="${c}" ${c === g.cat ? 'checked' : ''}><span>${c}</span></label>`).join('')}</div></div>
+        <div class="field"><span class="flabel">Categoria</span>
+          <div class="chips" id="g-chips">${(g.cat && !catsGasto().includes(g.cat) ? [...catsGasto(), g.cat] : catsGasto()).map(c => chipCategoria(c, c === g.cat)).join('')}<button type="button" class="chip-add" data-a="mostrar-nova-cat">+ Nova</button></div>
+          <div class="nova-cat" id="g-nova-cat" hidden>
+            <input id="g-nova-cat-nome" maxlength="30" placeholder="Nome da categoria" autocomplete="off">
+            <button type="button" class="btn small" data-a="criar-cat-inline">Criar</button>
+          </div>
+        </div>
         <div class="field"><span class="flabel">Pagou com</span><div class="seg">${Object.entries(FORMAS).map(([k, t]) => `<label><input type="radio" id="g-forma-${k}" name="forma" value="${k}" ${k === g.forma ? 'checked' : ''}><span>${t}</span></label>`).join('')}</div>
           <span class="hint" data-hint-credito ${g.forma === 'credito' ? '' : 'hidden'}>No crédito o valor não sai do saldo agora. Ele entra na fatura do cartão.</span></div>
         <div class="field"><label for="g-data">Data</label><input id="g-data" type="date" name="data" required value="${g.data}"></div>
@@ -1159,6 +1234,25 @@
       case 'nova-conta': formConta(); break;
       case 'nova-entrada': formEntrada(); break;
       case 'novo-gasto': formGasto(); break;
+      case 'mostrar-nova-cat': $('#g-nova-cat').hidden = false; $('#g-nova-cat-nome').focus(); break;
+      case 'criar-cat-inline': criarCatInline(); break;
+      case 'nova-categoria': formCategoria(); break;
+      case 'renomear-categoria': formCategoria(t.dataset.nome); break;
+      case 'remover-categoria': {
+        const nome = t.dataset.nome;
+        if (catsGasto().length <= 1) { toast('Deixe pelo menos uma categoria.'); break; }
+        const n = usoCategoria(nome);
+        confirmar({
+          titulo: `Remover ${esc(nome)}?`,
+          texto: n ? `Ela sai da lista para novos gastos. Os ${n} gastos já lançados continuam com esse nome e seguem aparecendo nos resumos.` : 'Ela sai da lista de categorias.',
+          botao: 'Remover', perigo: true
+        }, () => {
+          S.catGasto = catsGasto().filter(c => c !== nome);
+          save(); render();
+          toast('Categoria removida.');
+        });
+        break;
+      }
       case 'editar-conta': formConta(S.contas.find(x => x.id === id)); break;
       case 'editar-entrada': formEntrada(S.entradas.find(x => x.id === id)); break;
       case 'editar-gasto': { const r = acharGasto(id); if (r) formGasto(r.g); break; }
@@ -1264,6 +1358,7 @@
 
   document.addEventListener('keydown', ev => {
     if ((ev.key === 'Enter' || ev.key === ' ') && ev.target.matches('.row.tap')) { ev.preventDefault(); ev.target.click(); }
+    if (ev.key === 'Enter' && ev.target.id === 'g-nova-cat-nome') { ev.preventDefault(); criarCatInline(); }
   });
 
   document.addEventListener('change', ev => {
@@ -1319,6 +1414,21 @@
         erro.hidden = false;
         f.senha.select();
       });
+      return;
+    }
+
+    if (tipo === 'categoria') {
+      const antigo = form.dataset.antigo;
+      if (antigo) {
+        const erro = renomearCategoria(antigo, f.nome.value);
+        if (erro) { toast(erro); return; }
+        toast('Categoria renomeada.');
+      } else {
+        const r = criarCategoria(f.nome.value);
+        if (r.erro) { toast(r.erro); return; }
+        toast(`Categoria ${r.nome} criada.`);
+      }
+      fecharModal(); render();
       return;
     }
 
